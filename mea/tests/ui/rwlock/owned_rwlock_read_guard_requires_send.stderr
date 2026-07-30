@@ -1,0 +1,19 @@
+error[E0277]: `std::sync::MutexGuard<'static, ()>` cannot be sent between threads safely
+  --> tests/ui/rwlock/owned_rwlock_read_guard_requires_send.rs:22:19
+   |
+22 |     assert_send::<OwnedRwLockReadGuard<MutexGuard<'static, ()>>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `std::sync::MutexGuard<'static, ()>` cannot be sent between threads safely
+   |
+   = help: the trait `Send` is not implemented for `std::sync::MutexGuard<'static, ()>`
+   = note: required for `mea::rwlock::RwLock<std::sync::MutexGuard<'static, ()>>` to implement `Sync`
+   = note: required for `Arc<mea::rwlock::RwLock<std::sync::MutexGuard<'static, ()>>>` to implement `Send`
+note: required because it appears within the type `OwnedRwLockReadGuard<std::sync::MutexGuard<'static, ()>>`
+  --> src/rwlock/owned_read_guard.rs
+   |
+   | pub struct OwnedRwLockReadGuard<T: ?Sized> {
+   |            ^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+  --> tests/ui/rwlock/owned_rwlock_read_guard_requires_send.rs:19:19
+   |
+19 | fn assert_send<T: Send>() {}
+   |                   ^^^^ required by this bound in `assert_send`

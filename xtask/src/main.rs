@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::process::Command as StdCommand;
 
 use clap::Parser;
@@ -27,8 +28,10 @@ impl Command {
     fn run(self) {
         match self.sub {
             SubCommand::Build(cmd) => cmd.run(),
+            SubCommand::Check(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
+            SubCommand::TestUi(cmd) => cmd.run(),
         }
     }
 }
@@ -37,10 +40,14 @@ impl Command {
 enum SubCommand {
     #[clap(about = "Compile workspace packages.")]
     Build(CommandBuild),
+    #[clap(about = "Check mea under the feature matrix.")]
+    Check(CommandCheck),
     #[clap(about = "Run format and clippy checks.")]
     Lint(CommandLint),
     #[clap(about = "Run unit tests.")]
     Test(CommandTest),
+    #[clap(about = "Run UI tests on the MSRV toolchain.")]
+    TestUi(CommandTestUi),
 }
 
 #[derive(Parser)]
@@ -56,6 +63,24 @@ impl CommandBuild {
 }
 
 #[derive(Parser)]
+struct CommandCheck {}
+
+impl CommandCheck {
+    fn run(self) {
+        let package = mea_package();
+        let features = mea_features(&package);
+
+        run_command(make_check_cmd(&[]));
+        for feature in &features {
+            run_command(make_check_cmd(std::slice::from_ref(feature)));
+        }
+        if features.len() > 1 {
+            run_command(make_check_cmd(&features));
+        }
+    }
+}
+
+#[derive(Parser)]
 struct CommandTest {
     #[arg(long, help = "Run tests serially and do not capture output.")]
     no_capture: bool,
@@ -63,8 +88,57 @@ struct CommandTest {
 
 impl CommandTest {
     fn run(self) {
-        run_command(make_test_cmd(self.no_capture, &[]));
+        let package = mea_package();
+        let features = mea_features(&package);
+        run_command(make_test_cmd(self.no_capture, &features));
     }
+}
+
+#[derive(Parser)]
+struct CommandTestUi {
+    #[arg(long, help = "Overwrite expected compiler diagnostics.")]
+    overwrite: bool,
+}
+
+impl CommandTestUi {
+    fn run(self) {
+        let package = mea_package();
+        let features = mea_features(&package);
+        let rust_version = package
+            .rust_version
+            .as_ref()
+            .expect("mea must declare its minimum supported Rust version")
+            .to_string();
+
+        run_command(make_ui_test_cmd(&features, &rust_version, self.overwrite));
+    }
+}
+
+fn mea_package() -> cargo_metadata::Package {
+    use cargo_metadata::Metadata;
+    use cargo_metadata::MetadataCommand;
+
+    let manifest = Path::new(env!("CARGO_WORKSPACE_DIR")).join("Cargo.toml");
+    let Metadata { packages, .. } = MetadataCommand::new()
+        .manifest_path(manifest)
+        .exec()
+        .expect("failed to get cargo metadata");
+
+    packages
+        .into_iter()
+        .find(|package| package.name == "mea")
+        .expect("failed to find mea package")
+}
+
+fn mea_features(package: &cargo_metadata::Package) -> Vec<String> {
+    let mut features = package
+        .features
+        .keys()
+        .filter(|feature| feature.as_str() != "default")
+        .cloned()
+        .collect::<Vec<_>>();
+    features.sort();
+    features
 }
 
 #[derive(Parser)]
@@ -128,14 +202,46 @@ fn make_build_cmd(locked: bool) -> StdCommand {
     cmd
 }
 
-fn make_test_cmd(no_capture: bool, features: &[&str]) -> StdCommand {
+fn make_test_cmd(no_capture: bool, features: &[String]) -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.args(["test", "--workspace", "--no-default-features"]);
-    if !features.is_empty() {
-        cmd.args(["--features", features.join(",").as_str()]);
+    for feature in features {
+        cmd.arg("--features").arg(format!("mea/{feature}"));
     }
     if no_capture {
         cmd.args(["--", "--nocapture"]);
+    }
+    cmd
+}
+
+fn make_ui_test_cmd(features: &[String], rust_version: &str, overwrite: bool) -> StdCommand {
+    let mut cmd = find_command("cargo");
+    cmd.arg(format!("+{rust_version}"));
+    cmd.args(["test", "--package", "mea", "--no-default-features"]);
+    for feature in features {
+        cmd.arg("--features").arg(feature);
+    }
+    cmd.args(["--test", "mutex_ui", "--test", "rwlock_ui"]);
+    cmd.args(["--", "--ignored"]);
+    if overwrite {
+        cmd.env("TRYBUILD", "overwrite");
+    }
+    cmd
+}
+
+fn make_check_cmd(features: &[String]) -> StdCommand {
+    let mut cmd = find_command("cargo");
+    cmd.env("RUSTFLAGS", "-Dwarnings");
+    cmd.args([
+        "+nightly",
+        "check",
+        "--package",
+        "mea",
+        "--all-targets",
+        "--no-default-features",
+    ]);
+    for feature in features {
+        cmd.arg("--features").arg(feature);
     }
     cmd
 }

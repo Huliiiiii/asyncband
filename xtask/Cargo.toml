@@ -27,6 +27,7 @@ rust-version.workspace = true
 release = false
 
 [dependencies]
+cargo_metadata = { version = "0.19.2" }
 clap = { version = "4.5.20", features = ["derive"] }
 which = { version = "8.0.0" }
 

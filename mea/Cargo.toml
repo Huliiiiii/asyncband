@@ -35,10 +35,21 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 slab = { version = "0.4.11" }
 
+# Keep UI test targets separate by primitive so each target can use a matching
+# `required-features` gate when primitives become optional.
+[[test]]
+name = "mutex_ui"
+path = "tests/mutex_ui/main.rs"
+
+[[test]]
+name = "rwlock_ui"
+path = "tests/rwlock_ui/main.rs"
+
 [dev-dependencies]
 pollster = { version = "0.4.0", features = ["macro"] }
 tokio = { version = "1.41.0", features = ["full"] }
 tokio-test = { version = "0.4.4" }
+trybuild = { version = "1.0.118" }
 
 [lints]
 workspace = true

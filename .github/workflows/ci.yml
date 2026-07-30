@@ -47,7 +47,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: typos-cli,taplo-cli,hawkeye
-      - run: cargo x lint
+      - name: Run linters
+        run: cargo x lint
+      - name: Check feature matrix
+        run: cargo x check
 
   test:
     name: Run tests
@@ -69,6 +72,10 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
       - name: Run unit tests
         run: cargo x test --no-capture
+        shell: bash
+      - name: Run UI tests on MSRV
+        if: matrix.os == 'ubuntu-24.04' && matrix['rust-version'] != 'stable'
+        run: cargo x test-ui
         shell: bash
 
   required:

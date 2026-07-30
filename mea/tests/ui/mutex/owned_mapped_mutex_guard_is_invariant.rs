@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compile-fail tests for guard `Send` and `Sync` contracts.
-//!
-//! An owned guard can hold the last strong reference to its lock. Moving the guard can therefore
-//! move destruction of the protected value to another thread, so the value must be `Send`.
-//!
-//! `std::sync::MutexGuard` is `Sync` but not `Send`, making it a useful regression case:
-//!
-//! ```compile_fail
-//! use std::sync::MutexGuard;
-//!
-//! use mea::rwlock::OwnedRwLockReadGuard;
-//!
-//! fn assert_send<T: Send>() {}
-//!
-//! assert_send::<OwnedRwLockReadGuard<MutexGuard<'static, ()>>>();
-//! ```
+use mea::mutex::OwnedMappedMutexGuard;
+
+fn shorten<'short>(
+    guard: OwnedMappedMutexGuard<(), &'static str>,
+    value: &'short str,
+) -> OwnedMappedMutexGuard<(), &'short str> {
+    let mut guard: OwnedMappedMutexGuard<(), &'short str> = guard;
+    *guard = value;
+    guard
+}
+
+fn main() {}

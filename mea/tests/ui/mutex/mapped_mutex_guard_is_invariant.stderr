@@ -1,0 +1,12 @@
+error: lifetime may not live long enough
+  --> tests/ui/mutex/mapped_mutex_guard_is_invariant.rs:21:20
+   |
+17 | fn shorten<'lock, 'short: 'lock>(
+   |                   ------ lifetime `'short` defined here
+...
+21 |     let mut guard: MappedMutexGuard<'lock, &'short str> = guard;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ type annotation requires that `'short` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `mea::mutex::MappedMutexGuard<'_, &str>`, which makes the generic argument `&str` invariant
+   = note: the struct `mea::mutex::MappedMutexGuard<'a, T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
