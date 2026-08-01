@@ -65,11 +65,21 @@ impl<V> Entry<V> {
     }
 
     fn acquire(&self) {
-        self.active_calls
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active_calls| {
-                active_calls.checked_add(1)
-            })
-            .expect("too many concurrent OnceMap calls");
+        let mut active_calls = self.active_calls.load(Ordering::Relaxed);
+        loop {
+            let next = active_calls
+                .checked_add(1)
+                .expect("too many concurrent OnceMap calls");
+            match self.active_calls.compare_exchange_weak(
+                active_calls,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => active_calls = current,
+            }
+        }
     }
 
     fn release(&self) -> bool {
