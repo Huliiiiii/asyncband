@@ -14,10 +14,13 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::RandomState;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use crate::internal::Mutex;
 use crate::once::OnceCell;
@@ -31,7 +34,71 @@ mod tests;
 /// to wrap the `V` in an `Arc<V>` to make cloning cheap.
 #[derive(Debug)]
 pub struct OnceMap<K, V, S = RandomState> {
-    map: Mutex<HashMap<K, Arc<OnceCell<V>>, S>>,
+    map: Mutex<HashMap<K, Arc<Entry<V>>, S>>,
+}
+
+struct Entry<V> {
+    cell: OnceCell<V>,
+    // This counter only tracks entry liveness; the map mutex serializes attachment and cleanup.
+    active_calls: AtomicUsize,
+}
+
+impl<V: fmt::Debug> fmt::Debug for Entry<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cell.fmt(f)
+    }
+}
+
+impl<V> Entry<V> {
+    fn new() -> Self {
+        Self {
+            cell: OnceCell::new(),
+            active_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn from_value(value: V) -> Self {
+        Self {
+            cell: OnceCell::from_value(value),
+            active_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire(&self) {
+        self.active_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active_calls| {
+                active_calls.checked_add(1)
+            })
+            .expect("too many concurrent OnceMap calls");
+    }
+
+    fn release(&self) -> bool {
+        let active_calls = self.active_calls.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(active_calls > 0);
+        active_calls == 1
+    }
+}
+
+struct EntryGuard<'a, K, V, S> {
+    map: &'a Mutex<HashMap<K, Arc<Entry<V>>, S>>,
+    entry: Arc<Entry<V>>,
+}
+
+impl<K, V, S> Drop for EntryGuard<'_, K, V, S> {
+    fn drop(&mut self) {
+        if !self.entry.release() || self.entry.cell.get().is_some() {
+            return;
+        }
+
+        let mut map = self.map.lock();
+        if self.entry.active_calls.load(Ordering::Relaxed) != 0 || self.entry.cell.get().is_some() {
+            return;
+        }
+
+        // K does not need to be Clone, so locate the failed entry by Arc identity. This scan only
+        // runs when the last caller leaves an entry uninitialized.
+        map.retain(|_, entry| !Arc::ptr_eq(entry, &self.entry));
+    }
 }
 
 impl<K, V, S> Default for OnceMap<K, V, S>
@@ -89,21 +156,31 @@ where
     ///
     /// If the value for the key is already being computed by another task, this task will wait for
     /// the computation to finish and return the result.
+    ///
+    /// If the computation is cancelled or panics, another current caller may retry it. The empty
+    /// entry is removed once no current callers remain.
     pub async fn compute<F>(&self, key: K, func: F) -> V
     where
         F: AsyncFnOnce() -> V,
     {
         // 1. Get or create the OnceCell.
-        let cell = {
+        let entry = {
             let mut map = self.map.lock();
-            map.entry(key)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+            let entry = map
+                .entry(key)
+                .or_insert_with(|| Arc::new(Entry::new()))
+                .clone();
+            entry.acquire();
+            entry
+        };
+        let guard = EntryGuard {
+            map: &self.map,
+            entry,
         };
 
         // 2. Try to initialize the cell.
         // OnceCell::get_or_init guarantees that only one task executes the closure.
-        let res = cell.get_or_init(func).await;
+        let res = guard.entry.cell.get_or_init(func).await;
         res.clone()
     }
 
@@ -113,22 +190,30 @@ where
     /// the computation to finish and return the result.
     ///
     /// If the computation fails, the error is returned and the value is not stored. Other tasks
-    /// waiting for the value will retry the computation.
+    /// waiting for the value will retry the computation. Once no current callers remain, the empty
+    /// entry is removed.
     pub async fn try_compute<E, F>(&self, key: K, func: F) -> Result<V, E>
     where
         F: AsyncFnOnce() -> Result<V, E>,
     {
         // 1. Get or create the OnceCell.
-        let cell = {
+        let entry = {
             let mut map = self.map.lock();
-            map.entry(key)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+            let entry = map
+                .entry(key)
+                .or_insert_with(|| Arc::new(Entry::new()))
+                .clone();
+            entry.acquire();
+            entry
+        };
+        let guard = EntryGuard {
+            map: &self.map,
+            entry,
         };
 
         // 2. Try to initialize the cell.
         // OnceCell::get_or_try_init guarantees that only one task executes the closure.
-        let res = cell.get_or_try_init(func).await?;
+        let res = guard.entry.cell.get_or_try_init(func).await?;
         Ok(res.clone())
     }
 
@@ -139,8 +224,8 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let map = self.map.lock();
-        let cell = map.get(key)?;
-        cell.get().cloned()
+        let entry = map.get(key)?;
+        entry.cell.get().cloned()
     }
 
     /// Remove the given key from the map.
@@ -168,8 +253,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let cell = self.map.lock().remove(key)?;
-        cell.get().cloned()
+        let entry = self.map.lock().remove(key)?;
+        entry.cell.get().cloned()
     }
 }
 
@@ -183,7 +268,7 @@ where
         Self {
             map: Mutex::new(
                 iter.into_iter()
-                    .map(|(k, v)| (k, Arc::new(OnceCell::from_value(v))))
+                    .map(|(k, v)| (k, Arc::new(Entry::from_value(v))))
                     .collect(),
             ),
         }

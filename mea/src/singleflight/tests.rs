@@ -137,10 +137,107 @@ async fn test_panic_safe() {
     // Wait for h1 to panic and exit
     let err = h1.await.unwrap_err();
     assert!(err.is_panic());
+    assert!(group.map.lock().is_empty());
 
     // Next task should succeed (new attempt)
     let res = group.work("key", || async { "success".to_string() }).await;
     assert_eq!(res, "success");
+}
+
+#[tokio::test]
+async fn test_cancelled_work_removes_empty_entry() {
+    let group = Arc::new(Group::<&str, &str>::new());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+    let group_clone = group.clone();
+    let task = tokio::spawn(async move {
+        group_clone
+            .work("key", || async move {
+                started_tx.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+    });
+
+    started_rx.await.unwrap();
+    assert_eq!(group.map.lock().len(), 1);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(group.map.lock().is_empty());
+}
+
+#[tokio::test]
+async fn test_cancelled_work_keeps_entry_for_existing_waiters() {
+    let group = Arc::new(Group::<&str, &str>::new());
+    let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+
+    let group_clone = group.clone();
+    let first = tokio::spawn(async move {
+        group_clone
+            .work("key", || async move {
+                first_started_tx.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+    });
+    first_started_rx.await.unwrap();
+
+    let original_entry = group.map.lock().get("key").unwrap().clone();
+    let retry_release = Arc::new(tokio::sync::Notify::new());
+    let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+    let group_clone = group.clone();
+    let retry_release_clone = retry_release.clone();
+    let retry = tokio::spawn(async move {
+        group_clone
+            .work("key", || async move {
+                retry_started_tx.send(()).unwrap();
+                retry_release_clone.notified().await;
+                "retry"
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while original_entry.active_calls.load(Ordering::Relaxed) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    retry_started_rx.await.unwrap();
+
+    let current_entry = group.map.lock().get("key").unwrap().clone();
+    assert!(Arc::ptr_eq(&original_entry, &current_entry));
+
+    let unexpected_calls = Arc::new(AtomicUsize::new(0));
+    let group_clone = group.clone();
+    let unexpected_calls_clone = unexpected_calls.clone();
+    let duplicate = tokio::spawn(async move {
+        group_clone
+            .work("key", || async move {
+                unexpected_calls_clone.fetch_add(1, Ordering::SeqCst);
+                "duplicate"
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while original_entry.active_calls.load(Ordering::Relaxed) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    retry_release.notify_one();
+    assert_eq!(retry.await.unwrap(), "retry");
+    assert_eq!(duplicate.await.unwrap(), "retry");
+    assert_eq!(unexpected_calls.load(Ordering::SeqCst), 0);
+    assert!(group.map.lock().is_empty());
 }
 
 #[tokio::test]
@@ -192,6 +289,7 @@ async fn test_try_work_failure() {
         .try_work("key", || async { Err::<&str, &str>("error") })
         .await;
     assert_eq!(res, Err("error"));
+    assert!(group.map.lock().is_empty());
 
     // Retry should work
     let res2 = group

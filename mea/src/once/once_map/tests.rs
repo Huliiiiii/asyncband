@@ -75,6 +75,7 @@ async fn test_try_compute() {
     // Fail first
     let res: Result<i32, &str> = map.try_compute("key", async || Err("fail")).await;
     assert_eq!(res, Err("fail"));
+    assert!(map.map.lock().is_empty());
 
     // Success then
     let res: Result<i32, &str> = map.try_compute("key", async || Ok::<i32, &str>(1)).await;
@@ -83,6 +84,29 @@ async fn test_try_compute() {
     // Cached
     let res: Result<i32, &str> = map.try_compute("key", async || Ok::<i32, &str>(2)).await;
     assert_eq!(res, Ok(1));
+}
+
+#[tokio::test]
+async fn test_cancelled_compute_removes_empty_entry() {
+    let map = Arc::new(OnceMap::<&str, i32>::new());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+    let map_clone = map.clone();
+    let task = tokio::spawn(async move {
+        map_clone
+            .compute("key", async move || {
+                started_tx.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+    });
+
+    started_rx.await.unwrap();
+    assert_eq!(map.map.lock().len(), 1);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(map.map.lock().is_empty());
 }
 
 #[tokio::test]
@@ -122,6 +146,8 @@ async fn test_try_compute_concurrent_failure_then_success() {
     let res2 = t2.await.unwrap();
     assert_eq!(res2, Ok(1));
     assert!(success.load(Ordering::SeqCst));
+    assert_eq!(map.map.lock().len(), 1);
+    assert_eq!(map.get("key"), Some(1));
 }
 
 #[tokio::test]
